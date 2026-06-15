@@ -17,7 +17,7 @@ The command
 
 ./sky_map 100
 
-will generate a catalog of 100 detectable BNS mergers (SNR >= 8). The code randomly draws sources uniformly in co-moving volume, with random orientations and masses that follow a Gaussian distribution with mean 1.4 and standard deviation 0.2. The dimensionless spins are uniform in the range 0 to 0.1. The maximum distance for then uniform in volume draw is fixed by the overall detector sensitivity, which is computed first and reported. The BNS range uses the standard LIGO definition and is computed using a Monte Carlo integration that is very fast.
+will generate a catalog of 100 detectable BNS mergers (SNR >= 8). The code randomly draws sources uniformly in co-moving volume, with random orientations and masses that follow a Gaussian distribution with mean 1.4 and standard deviation 0.2. The dimensionless spins are uniform in the range 0 to 0.1. The maximum distance for then uniform in volume draw is fixed by the overall detector sensitivity, which is computed first and reported. The BNS range uses the standard LIGO definition and is computed using a Monte Carlo integration that is very fast. The code also computes the number of detections per year using the GWTC-5 BNS rate as a reference. The reference rate range can be changed in the header file.
 
 The code produces fairly verbose output as it runs, including the SNR of each source, the 50%n and 90% credible sky areas, the MCMC proposal acceptances etc. Don't worry if the Ring and Antipodal proposals have low acceptance rates. With a 4 detector network the sky maps are usually single regions, without the big bananas of a Hanford-Livingston map. 
 
