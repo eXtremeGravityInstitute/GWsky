@@ -5,7 +5,7 @@ The sky_map catalog mode writes four histogram files in the skymaps directory:
 
     area50_histogram.dat
     area90_histogram.dat
-    distance_histogram.dat
+    distance90_interval_histogram.dat
     snr_histogram.dat
 
 Each file contains header metadata followed by columns
@@ -13,7 +13,7 @@ Each file contains header metadata followed by columns
     bin_low bin_high bin_center count fraction density
 
 This script uses the per-bin fractions for the bar heights, and marks the
-sample mean from the file header in each panel.
+sample median from the file header in each panel.
 """
 
 from __future__ import annotations
@@ -50,9 +50,9 @@ HISTOGRAMS = (
         "color": "#b23a48",
     },
     {
-        "filename": "distance_histogram.dat",
-        "title": "Detected luminosity distance",
-        "xlabel": r"$D_L$ (Mpc)",
+        "filename": "distance90_interval_histogram.dat",
+        "title": "90% luminosity-distance interval",
+        "xlabel": r"90% interval width in $D_L$ (Mpc)",
         "color": "#2f7f7b",
     },
     {
@@ -98,6 +98,8 @@ def parse_header(path: Path) -> dict[str, object]:
                 meta["sample_min"] = float(values[0])
                 meta["sample_max"] = float(values[1])
                 meta["sample_mean"] = float(values[2])
+            elif key == "sample_median" and values:
+                meta["sample_median"] = float(values[0])
             elif key == "underflow_overflow" and len(values) >= 2:
                 meta["underflow"] = int(values[0])
                 meta["overflow"] = int(values[1])
@@ -108,7 +110,10 @@ def parse_header(path: Path) -> dict[str, object]:
 def read_histogram(path: Path) -> tuple[dict[str, object], np.ndarray]:
     """Load a histogram file and return metadata plus a 2D data array."""
     if not path.exists():
-        raise FileNotFoundError(f"Missing histogram file: {path}")
+        raise FileNotFoundError(
+            f"Missing histogram file: {path}. If this is distance90_interval_histogram.dat, "
+            "rerun sky_map so the new luminosity-distance posterior intervals are written."
+        )
 
     meta = parse_header(path)
     data = np.loadtxt(path, comments="#")
@@ -134,6 +139,29 @@ def compact_number(x: float) -> str:
     if ax >= 10.0:
         return f"{x:.2f}"
     return f"{x:.3f}"
+
+
+def median_from_histogram(data: np.ndarray) -> float | None:
+    """Estimate the median from histogram counts when no exact header median exists."""
+    counts = data[:, 3]
+    total = np.sum(counts)
+    if total <= 0.0:
+        return None
+
+    target = 0.5 * total
+    cumulative = 0.0
+
+    for row in data:
+        low, high, _center, count = row[:4]
+        if count <= 0.0:
+            continue
+        if cumulative + count >= target:
+            frac = (target - cumulative) / count
+            frac = min(max(frac, 0.0), 1.0)
+            return low + frac * (high - low)
+        cumulative += count
+
+    return float(data[-1, 2])
 
 
 def apply_plot_style() -> None:
@@ -184,9 +212,11 @@ def plot_histogram_panel(ax: plt.Axes, path: Path, spec: dict[str, str], show_de
         alpha=0.88,
     )
 
-    mean = meta.get("sample_mean")
-    if isinstance(mean, float) and np.isfinite(mean):
-        ax.axvline(mean, color="#151515", linewidth=1.25, linestyle="--", alpha=0.9)
+    median = meta.get("sample_median")
+    if not isinstance(median, float) or not np.isfinite(median):
+        median = median_from_histogram(data)
+    if isinstance(median, float) and np.isfinite(median):
+        ax.axvline(median, color="#151515", linewidth=1.25, linestyle="--", alpha=0.9)
 
     ax.set_title(spec["title"])
     ax.set_xlabel(spec["xlabel"])
@@ -205,8 +235,8 @@ def plot_histogram_panel(ax: plt.Axes, path: Path, spec: dict[str, str], show_de
     text_lines = []
     if samples is not None:
         text_lines.append(f"N = {samples}")
-    if isinstance(mean, float) and np.isfinite(mean):
-        text_lines.append(f"mean = {compact_number(mean)}")
+    if isinstance(median, float) and np.isfinite(median):
+        text_lines.append(f"median = {compact_number(median)}")
     if text_lines:
         ax.text(
             0.97,

@@ -42,7 +42,33 @@ typedef struct {
     long boundary_pixels;
     double map_theta;
     double map_phi;
+    double dl_median;
+    double dl50_low;
+    double dl50_high;
+    double dl50_width;
+    double dl90_low;
+    double dl90_high;
+    double dl90_width;
 } SkyPostSummary;
+
+typedef struct {
+    int intrinsic_draws;
+    int orientation_draws;
+    long angular_draws;
+    double effective_detected;
+    double efficiency;
+    double efficiency_sigma;
+    double max_luminosity_distance;
+    double max_redshift;
+    double max_comoving_distance;
+    double comoving_volume_gpc3;
+    double merger_rate_low;
+    double merger_rate_high;
+    double mergers_per_year_low;
+    double mergers_per_year_high;
+    double detections_per_year_low;
+    double detections_per_year_high;
+} BnsRateSummary;
 
 static void initialize_chain_state(struct Net *net, double *params, double **paramx, double **pallx, double **skyx, int *who, double *heat, int *mxc);
 static void prepare_internal_params(double *params, const double *file_params, double Tobs, double offset);
@@ -60,15 +86,17 @@ static double compute_exact_detection_snr(struct Net *net, Detector *network, do
 static double fast_network_snr2(struct Net *net, Detector *network, double **SN, double *params, double Tobs, int N, double *detector_snr);
 static int fast_detector_snr2_norms(struct Net *net, double **SN, double *params, double Tobs, int N, double *detector_norm2);
 static double estimate_bns_range(struct Net *net, Detector *network, double **SN, int N, double Tobs, gsl_rng *r, double *mean_threshold_distance, double *max_threshold_distance);
+static int estimate_bns_detection_rate(struct Net *net, Detector *network, double **SN, int N, double Tobs, double max_luminosity_distance_mpc, gsl_rng *r, BnsRateSummary *summary);
 static double interpolate_uniform_spectrum(double *y, int n, double Tobs, double f);
 static void setup_source_likelihood(struct Net *net, Detector *network, double *params, double **D, double **SN, double **data, double *hwave, double ***wave, double *DD, double **WW, double ***DHc, double ***DHs, double ***HH, double **skyx, double **paramx, double **pallx, int *who, double *heat, int *mxc, double *logLsky, RealVector *freq, int N, int nt, double Tobs);
 static int run_source_mcmc(struct Net *net, Detector *network, double *params, double **D, double **SN, double **data, double *hwave, double ***wave, double *DD, double **WW, double ***DHc, double ***DHs, double ***HH, double **skyx, double **paramx, double **pallx, int *who, double *heat, int *mxc, double *logLsky, RealVector *freq, int N, int nt, double Tobs, double dt, int Nsky, gsl_rng *r, SkyPostSummary *summary);
 static int ensure_directory(const char *path);
 static int move_file_to_source_name(const char *source, const char *dest_dir, const char *prefix, int source_id);
 static int write_summary_file(const char *filename, int source_id, int attempts, const SkyPostSummary *summary, struct Net *net, Detector *network, const double *detector_snr, double network_snr);
-static int write_population_histograms(const char *dest_dir, const double *area50, const double *area90, const double *distance, const double *snr, int n, double distance_max_mpc);
+static int write_population_histograms(const char *dest_dir, const double *area50, const double *area90, const double *distance, const double *dl90_width, const double *snr, int n, double distance_max_mpc);
 static int write_histogram_file(const char *filename, const char *quantity, const char *units, const double *values, int n, int nbins, double xmin, double xmax);
 static double finite_array_max(const double *values, int n);
+static double sorted_quantile(const double *sorted, long n, double q);
 static int postprocess_sky_chain(const char *chain_file, long Nside, SkyPostSummary *summary);
 static int parameter_array_length(struct Net *net);
 static int skyhist_is_power_of_two(long n);
@@ -113,7 +141,7 @@ int main(int argc, char *argv[])
     FILE *in;
     FILE *chain;
     const gsl_rng_type *P;
-    gsl_rng *r, *range_rng;
+    gsl_rng *r, *range_rng, *rate_rng;
     
     //##############################################
     //open MP modifications
@@ -240,12 +268,14 @@ int main(int argc, char *argv[])
     double file_params[NP];
     double detector_snr[DETECTOR_CATALOG_SIZE];
     double network_snr, bns_range, bns_mean_distance, bns_max_distance, catalog_max_distance;
-    double *catalog_area50, *catalog_area90, *catalog_distance, *catalog_snr;
+    double *catalog_area50, *catalog_area90, *catalog_distance, *catalog_dl90_width, *catalog_snr;
     SkyPostSummary sky_summary;
+    BnsRateSummary rate_summary;
     char filename[1024];
     catalog_area50 = NULL;
     catalog_area90 = NULL;
     catalog_distance = NULL;
+    catalog_dl90_width = NULL;
     catalog_snr = NULL;
     
     if(argc > 1) catalog_sources = atoi(argv[1]);
@@ -267,6 +297,33 @@ int main(int argc, char *argv[])
     printf("BNS arithmetic mean threshold distance = %.2f Mpc; max sampled threshold distance = %.2f Mpc\n",
            bns_mean_distance, bns_max_distance);
     catalog_max_distance = BNS_POPULATION_DISTANCE_SCALE*bns_max_distance;
+    
+    rate_rng = gsl_rng_alloc(P);
+    if(rate_rng == NULL)
+    {
+        fprintf(stderr, "Could not allocate BNS detection-rate random number generator\n");
+        return 1;
+    }
+    gsl_rng_set(rate_rng, 104729);
+    if(estimate_bns_detection_rate(net, network, SN, N, Tobs, catalog_max_distance, rate_rng, &rate_summary) != 0)
+    {
+        gsl_rng_free(rate_rng);
+        return 1;
+    }
+    gsl_rng_free(rate_rng);
+    
+    printf("BNS rate Monte Carlo = %d mass/spin draws x %d sky/orientation draws = %ld angular draws in %.4f Gpc^3 (DLmax %.2f Mpc, zmax %.4f)\n",
+           rate_summary.intrinsic_draws, rate_summary.orientation_draws,
+           rate_summary.angular_draws, rate_summary.comoving_volume_gpc3,
+           rate_summary.max_luminosity_distance, rate_summary.max_redshift);
+    printf("BNS detection efficiency = %.5f +/- %.5f (distance-integrated effective detections %.1f/%ld, SNR threshold %.1f)\n",
+           rate_summary.efficiency, rate_summary.efficiency_sigma,
+           rate_summary.effective_detected, rate_summary.angular_draws, BNS_SNR_THRESHOLD);
+    printf("BNS mergers in sampled volume = %.2f -- %.2f per year for rate %.1f -- %.1f Gpc^-3 yr^-1\n",
+           rate_summary.mergers_per_year_low, rate_summary.mergers_per_year_high,
+           rate_summary.merger_rate_low, rate_summary.merger_rate_high);
+    printf("BNS detections per year = %.2f -- %.2f for this network and threshold\n",
+           rate_summary.detections_per_year_low, rate_summary.detections_per_year_high);
     
     if(!catalog_mode)
     {
@@ -299,8 +356,9 @@ int main(int argc, char *argv[])
         catalog_area50 = double_vector(catalog_sources);
         catalog_area90 = double_vector(catalog_sources);
         catalog_distance = double_vector(catalog_sources);
+        catalog_dl90_width = double_vector(catalog_sources);
         catalog_snr = double_vector(catalog_sources);
-        if(catalog_area50 == NULL || catalog_area90 == NULL || catalog_distance == NULL || catalog_snr == NULL)
+        if(catalog_area50 == NULL || catalog_area90 == NULL || catalog_distance == NULL || catalog_dl90_width == NULL || catalog_snr == NULL)
         {
             fprintf(stderr, "Could not allocate population histogram arrays\n");
             return 1;
@@ -346,16 +404,18 @@ int main(int argc, char *argv[])
             catalog_area50[source_id-1] = sky_summary.area50;
             catalog_area90[source_id-1] = sky_summary.area90;
             catalog_distance[source_id-1] = file_params[6];
+            catalog_dl90_width[source_id-1] = sky_summary.dl90_width;
             catalog_snr[source_id-1] = network_snr;
             if(move_file_to_source_name("sky.dat", "skymaps", "sky", source_id) != 0) return 1;
             if(move_file_to_source_name("sky90_region.dat", "skymaps", "sky90_region", source_id) != 0) return 1;
             if(move_file_to_source_name("sky90_boundary.dat", "skymaps", "sky90_boundary", source_id) != 0) return 1;
         }
         
-        if(write_population_histograms("skymaps", catalog_area50, catalog_area90, catalog_distance, catalog_snr, catalog_sources, catalog_max_distance) != 0) return 1;
+        if(write_population_histograms("skymaps", catalog_area50, catalog_area90, catalog_distance, catalog_dl90_width, catalog_snr, catalog_sources, catalog_max_distance) != 0) return 1;
         free_double_vector(catalog_area50);
         free_double_vector(catalog_area90);
         free_double_vector(catalog_distance);
+        free_double_vector(catalog_dl90_width);
         free_double_vector(catalog_snr);
     }
     
@@ -468,7 +528,7 @@ static double draw_bns_mass(gsl_rng *r)
     do
     {
         m = BNS_MASS_MEAN_MSUN + BNS_MASS_SIGMA_MSUN*gsl_ran_gaussian(r, 1.0);
-    }while(m <= 0.0 || m > BNS_MASS_MAX_MSUN);
+    }while(m < BNS_MASS_MIN_MSUN || m > BNS_MASS_MAX_MSUN);
     
     return m;
 }
@@ -874,6 +934,243 @@ static double estimate_bns_range(struct Net *net, Detector *network, double **SN
     return cbrt(sum_d3/(double)BNS_RANGE_MC_DRAWS);
 }
 
+/*
+ * Estimate the BNS detection rate for the selected network and PSDs.
+ *
+ * This diagnostic intentionally uses the same population model as catalog
+ * generation: component masses from the truncated Gaussian, spins uniform in
+ * [0, BNS_SPIN_MAX], extrinsic angles isotropic, and sources uniform in
+ * comoving volume out to max_luminosity_distance_mpc.
+ *
+ * To avoid recomputing the waveform/PSD integral for every distance and sky
+ * draw, the MC is nested. We draw a modest number of mass/spin points, compute
+ * one detector SNR normalization per intrinsic draw at a reference luminosity
+ * distance, then draw many sky/orientation samples. Each angular sample gives
+ * a threshold luminosity distance D_thr from rho proportional to 1/D_L. Since
+ * the population is uniform in comoving volume, the distance-averaged detection
+ * probability for that angular sample is
+ *
+ *     p_dist = min[(D_c(D_thr) / D_c,max)^3, 1].
+ *
+ * The expected number of detections per year is then
+ *
+ *     N_det = p_det * V_comoving * R_BNS,
+ *
+ * where V_comoving is in Gpc^3 and R_BNS is the local merger rate in
+ * Gpc^-3 yr^-1. This mirrors the synthetic-catalog assumptions: the supplied
+ * rate is treated as constant across the sampled volume and no redshift
+ * evolution model is applied.
+ */
+static int estimate_bns_detection_rate(struct Net *net, Detector *network, double **SN, int N, double Tobs, double max_luminosity_distance_mpc, gsl_rng *r, BnsRateSummary *summary)
+{
+    int i, j, id, ifo, ntable;
+    double file_params[NP], params[NP];
+    double detector_norm2[DETECTOR_CATALOG_SIZE];
+    double Fp[DETECTOR_CATALOG_SIZE], Fc[DETECTOR_CATALOG_SIZE], dtimes[DETECTOR_CATALOG_SIZE];
+    double alpha, delta, sindec, psi, ciota, Ap, Ac, Fs2;
+    double snr2_ref, dthr, pvol, intrinsic_sum, intrinsic_mean;
+    double pdet, dcmax_mpc, zmax, volume_gpc3, sum_intrinsic, sum_intrinsic2, var_intrinsic;
+    double *dl_grid, *volume_fraction;
+    gsl_interp_accel *acc;
+    gsl_spline *spline;
+    
+    if(summary == NULL)
+    {
+        fprintf(stderr, "BNS rate summary pointer is NULL\n");
+        return 1;
+    }
+    if(BNS_RATE_INTRINSIC_DRAWS < 1)
+    {
+        fprintf(stderr, "BNS_RATE_INTRINSIC_DRAWS must be positive\n");
+        return 1;
+    }
+    if(BNS_RATE_ORIENTATION_DRAWS < 1)
+    {
+        fprintf(stderr, "BNS_RATE_ORIENTATION_DRAWS must be positive\n");
+        return 1;
+    }
+    if(BNS_RATE_DISTANCE_SPLINE_SIZE < 2)
+    {
+        fprintf(stderr, "BNS_RATE_DISTANCE_SPLINE_SIZE must be at least 2\n");
+        return 1;
+    }
+    if(max_luminosity_distance_mpc <= 0.0)
+    {
+        fprintf(stderr, "Invalid BNS rate maximum luminosity distance: %e Mpc\n", max_luminosity_distance_mpc);
+        return 1;
+    }
+    if(BNS_MERGER_RATE_LOW_GPC3_YR < 0.0 || BNS_MERGER_RATE_HIGH_GPC3_YR < BNS_MERGER_RATE_LOW_GPC3_YR)
+    {
+        fprintf(stderr, "Invalid BNS merger-rate interval: [%e, %e] Gpc^-3 yr^-1\n",
+                BNS_MERGER_RATE_LOW_GPC3_YR, BNS_MERGER_RATE_HIGH_GPC3_YR);
+        return 1;
+    }
+    
+    zmax = lcdm_redshift_from_luminosity_distance(max_luminosity_distance_mpc);
+    dcmax_mpc = lcdm_comoving_distance_mpc(zmax);
+    volume_gpc3 = (2.0*TPI/3.0)*pow(dcmax_mpc/1000.0, 3.0);
+    if(!isfinite(volume_gpc3) || volume_gpc3 <= 0.0)
+    {
+        fprintf(stderr, "Invalid BNS rate comoving volume for DLmax=%e Mpc\n", max_luminosity_distance_mpc);
+        return 1;
+    }
+    
+    ntable = BNS_RATE_DISTANCE_SPLINE_SIZE;
+    dl_grid = (double *)malloc(sizeof(double)*(size_t)ntable);
+    volume_fraction = (double *)malloc(sizeof(double)*(size_t)ntable);
+    acc = gsl_interp_accel_alloc();
+    spline = gsl_spline_alloc(gsl_interp_linear, ntable);
+    if(dl_grid == NULL || volume_fraction == NULL || acc == NULL || spline == NULL)
+    {
+        fprintf(stderr, "Could not allocate BNS rate distance-volume spline workspace\n");
+        free(dl_grid);
+        free(volume_fraction);
+        if(acc != NULL) gsl_interp_accel_free(acc);
+        if(spline != NULL) gsl_spline_free(spline);
+        return 1;
+    }
+    
+    for(j = 0; j < ntable; ++j)
+    {
+        double dl, z, dc, frac;
+        
+        if(j == 0)
+        {
+            dl_grid[j] = 0.0;
+            volume_fraction[j] = 0.0;
+        }
+        else if(j == ntable-1)
+        {
+            dl_grid[j] = max_luminosity_distance_mpc;
+            volume_fraction[j] = 1.0;
+        }
+        else
+        {
+            z = zmax*(double)j/(double)(ntable-1);
+            dc = lcdm_comoving_distance_mpc(z);
+            dl = (1.0+z)*dc;
+            dl_grid[j] = dl;
+            frac = pow(dc/dcmax_mpc, 3.0);
+            if(frac < 0.0) frac = 0.0;
+            if(frac > 1.0) frac = 1.0;
+            volume_fraction[j] = frac;
+        }
+    }
+    gsl_spline_init(spline, dl_grid, volume_fraction, ntable);
+    
+    sum_intrinsic = 0.0;
+    sum_intrinsic2 = 0.0;
+    
+    for(i = 0; i < BNS_RATE_INTRINSIC_DRAWS; ++i)
+    {
+        for(j = 0; j < NP; ++j) file_params[j] = 0.0;
+        file_params[0] = draw_bns_mass(r);
+        file_params[1] = draw_bns_mass(r);
+        file_params[2] = BNS_SPIN_MAX*gsl_rng_uniform(r);
+        file_params[3] = BNS_SPIN_MAX*gsl_rng_uniform(r);
+        file_params[4] = 0.0;
+        file_params[5] = Tobs-net->offset;
+        file_params[6] = BNS_RANGE_REFERENCE_DISTANCE_MPC;
+        file_params[7] = 0.0;
+        file_params[8] = 0.0;
+        file_params[9] = 0.0;
+        file_params[10] = 1.0;
+        prepare_internal_params(params, file_params, Tobs, net->offset);
+        
+        if(fast_detector_snr2_norms(net, SN, params, Tobs, N, detector_norm2) != 0)
+        {
+            gsl_spline_free(spline);
+            gsl_interp_accel_free(acc);
+            free(dl_grid);
+            free(volume_fraction);
+            return 1;
+        }
+        
+        intrinsic_sum = 0.0;
+        for(j = 0; j < BNS_RATE_ORIENTATION_DRAWS; ++j)
+        {
+            alpha = TPI*gsl_rng_uniform(r);
+            sindec = -1.0 + 2.0*gsl_rng_uniform(r);
+            delta = asin(sindec);
+            psi = PI*gsl_rng_uniform(r);
+            ciota = -1.0 + 2.0*gsl_rng_uniform(r);
+            Ap = 0.5*(1.0+ciota*ciota);
+            Ac = -ciota;
+            
+            Response(network, alpha, delta, psi, net->GMST, Fp, Fc, dtimes);
+            
+            snr2_ref = 0.0;
+            for(id = 0; id < net->Nifo; ++id)
+            {
+                ifo = net->labels[id];
+                Fs2 = Ap*Ap*Fp[ifo]*Fp[ifo] + Ac*Ac*Fc[ifo]*Fc[ifo];
+                snr2_ref += Fs2*detector_norm2[id];
+            }
+            
+            if(snr2_ref <= 0.0)
+            {
+                pvol = 0.0;
+            }
+            else
+            {
+                dthr = BNS_RANGE_REFERENCE_DISTANCE_MPC*sqrt(snr2_ref)/BNS_SNR_THRESHOLD;
+                if(dthr >= max_luminosity_distance_mpc)
+                {
+                    pvol = 1.0;
+                }
+                else if(dthr <= 0.0)
+                {
+                    pvol = 0.0;
+                }
+                else
+                {
+                    pvol = gsl_spline_eval(spline, dthr, acc);
+                    if(pvol < 0.0) pvol = 0.0;
+                    if(pvol > 1.0) pvol = 1.0;
+                }
+            }
+            
+            intrinsic_sum += pvol;
+        }
+        
+        intrinsic_mean = intrinsic_sum/(double)BNS_RATE_ORIENTATION_DRAWS;
+        sum_intrinsic += intrinsic_mean;
+        sum_intrinsic2 += intrinsic_mean*intrinsic_mean;
+    }
+    
+    gsl_spline_free(spline);
+    gsl_interp_accel_free(acc);
+    free(dl_grid);
+    free(volume_fraction);
+    
+    pdet = sum_intrinsic/(double)BNS_RATE_INTRINSIC_DRAWS;
+    var_intrinsic = 0.0;
+    if(BNS_RATE_INTRINSIC_DRAWS > 1)
+    {
+        var_intrinsic = (sum_intrinsic2-(double)BNS_RATE_INTRINSIC_DRAWS*pdet*pdet)/(double)(BNS_RATE_INTRINSIC_DRAWS-1);
+        if(var_intrinsic < 0.0) var_intrinsic = 0.0;
+    }
+    
+    summary->intrinsic_draws = BNS_RATE_INTRINSIC_DRAWS;
+    summary->orientation_draws = BNS_RATE_ORIENTATION_DRAWS;
+    summary->angular_draws = (long)BNS_RATE_INTRINSIC_DRAWS*(long)BNS_RATE_ORIENTATION_DRAWS;
+    summary->effective_detected = pdet*(double)summary->angular_draws;
+    summary->efficiency = pdet;
+    summary->efficiency_sigma = sqrt(var_intrinsic/(double)BNS_RATE_INTRINSIC_DRAWS);
+    summary->max_luminosity_distance = max_luminosity_distance_mpc;
+    summary->max_redshift = zmax;
+    summary->max_comoving_distance = dcmax_mpc;
+    summary->comoving_volume_gpc3 = volume_gpc3;
+    summary->merger_rate_low = BNS_MERGER_RATE_LOW_GPC3_YR;
+    summary->merger_rate_high = BNS_MERGER_RATE_HIGH_GPC3_YR;
+    summary->mergers_per_year_low = volume_gpc3*summary->merger_rate_low;
+    summary->mergers_per_year_high = volume_gpc3*summary->merger_rate_high;
+    summary->detections_per_year_low = pdet*summary->mergers_per_year_low;
+    summary->detections_per_year_high = pdet*summary->mergers_per_year_high;
+    
+    return 0;
+}
+
 static double interpolate_uniform_spectrum(double *y, int n, double Tobs, double f)
 {
     int i;
@@ -966,6 +1263,7 @@ static void setup_source_likelihood(struct Net *net, Detector *network, double *
 static int run_source_mcmc(struct Net *net, Detector *network, double *params, double **D, double **SN, double **data, double *hwave, double ***wave, double *DD, double **WW, double ***DHc, double ***DHs, double ***HH, double **skyx, double **paramx, double **pallx, int *who, double *heat, int *mxc, double *logLsky, RealVector *freq, int N, int nt, double Tobs, double dt, int Nsky, gsl_rng *r, SkyPostSummary *summary)
 {
     FILE *chain;
+    double actual_dl;
     
     setup_source_likelihood(net, network, params, D, SN, data, hwave, wave, DD, WW, DHc, DHs, HH, skyx, paramx, pallx, who, heat, mxc, logLsky, freq, N, nt, Tobs);
     
@@ -983,6 +1281,17 @@ static int run_source_mcmc(struct Net *net, Detector *network, double *params, d
     {
         fprintf(stderr, "Sky-chain post-processing failed\n");
         return 1;
+    }
+    
+    if(summary != NULL)
+    {
+        actual_dl = exp(params[6])/(1.0e6*PC_SI);
+        printf("Luminosity distance actual = %f Mpc, posterior median = %f Mpc\n",
+               actual_dl, summary->dl_median);
+        printf("Luminosity distance 50 percent credible interval = [%f, %f] Mpc, width = %f Mpc\n",
+               summary->dl50_low, summary->dl50_high, summary->dl50_width);
+        printf("Luminosity distance 90 percent credible interval = [%f, %f] Mpc, width = %f Mpc\n",
+               summary->dl90_low, summary->dl90_high, summary->dl90_width);
     }
     
     return 0;
@@ -1034,10 +1343,12 @@ static int write_summary_file(const char *filename, int source_id, int attempts,
         return 1;
     }
     
-    fprintf(out, "# source_id attempts area50_sq_deg area90_sq_deg boundary_pixels boundary_area_sq_deg map_theta_deg map_phi_deg network_snr\n");
-    fprintf(out, "%d %d %.16e %.16e %ld %.16e %.16e %.16e %.16e\n",
+    fprintf(out, "# source_id attempts area50_sq_deg area90_sq_deg boundary_pixels boundary_area_sq_deg map_theta_deg map_phi_deg network_snr dl_median_mpc dl50_low_mpc dl50_high_mpc dl50_width_mpc dl90_low_mpc dl90_high_mpc dl90_width_mpc\n");
+    fprintf(out, "%d %d %.16e %.16e %ld %.16e %.16e %.16e %.16e %.16e %.16e %.16e %.16e %.16e %.16e %.16e\n",
             source_id, attempts, summary->area50, summary->area90, summary->boundary_pixels,
-            summary->boundary_area, summary->map_theta, summary->map_phi, network_snr);
+            summary->boundary_area, summary->map_theta, summary->map_phi, network_snr,
+            summary->dl_median, summary->dl50_low, summary->dl50_high, summary->dl50_width,
+            summary->dl90_low, summary->dl90_high, summary->dl90_width);
     fprintf(out, "# detector_index detector_label detector_name snr\n");
     for(id = 0; id < net->Nifo; ++id)
     {
@@ -1049,10 +1360,10 @@ static int write_summary_file(const char *filename, int source_id, int attempts,
     return 0;
 }
 
-static int write_population_histograms(const char *dest_dir, const double *area50, const double *area90, const double *distance, const double *snr, int n, double distance_max_mpc)
+static int write_population_histograms(const char *dest_dir, const double *area50, const double *area90, const double *distance, const double *dl90_width, const double *snr, int n, double distance_max_mpc)
 {
     char filename[1024];
-    double area50_max, area90_max, distance_max, snr_max;
+    double area50_max, area90_max, distance_max, dl90_width_max, snr_max;
     
     if(n < 1) return 0;
     
@@ -1060,6 +1371,7 @@ static int write_population_histograms(const char *dest_dir, const double *area5
     area90_max = finite_array_max(area90, n);
     distance_max = distance_max_mpc;
     if(!isfinite(distance_max) || distance_max <= 0.0) distance_max = finite_array_max(distance, n);
+    dl90_width_max = finite_array_max(dl90_width, n);
     snr_max = finite_array_max(snr, n);
     
     snprintf(filename, sizeof(filename), "%s/area50_histogram.dat", dest_dir);
@@ -1071,10 +1383,13 @@ static int write_population_histograms(const char *dest_dir, const double *area5
     snprintf(filename, sizeof(filename), "%s/distance_histogram.dat", dest_dir);
     if(write_histogram_file(filename, "luminosity_distance", "Mpc", distance, n, POPULATION_HISTOGRAM_BINS, 0.0, distance_max) != 0) return 1;
     
+    snprintf(filename, sizeof(filename), "%s/distance90_interval_histogram.dat", dest_dir);
+    if(write_histogram_file(filename, "luminosity_distance_90_interval_width", "Mpc", dl90_width, n, POPULATION_HISTOGRAM_BINS, 0.0, dl90_width_max) != 0) return 1;
+    
     snprintf(filename, sizeof(filename), "%s/snr_histogram.dat", dest_dir);
     if(write_histogram_file(filename, "network_snr", "dimensionless", snr, n, POPULATION_HISTOGRAM_BINS, BNS_SNR_THRESHOLD, snr_max) != 0) return 1;
     
-    printf("Population histograms written to %s/area50_histogram.dat, %s/area90_histogram.dat, %s/distance_histogram.dat, and %s/snr_histogram.dat\n",
+    printf("Population histograms written to %s/area50_histogram.dat, %s/area90_histogram.dat, %s/distance90_interval_histogram.dat, and %s/snr_histogram.dat\n",
            dest_dir, dest_dir, dest_dir, dest_dir);
     
     return 0;
@@ -1085,7 +1400,8 @@ static int write_histogram_file(const char *filename, const char *quantity, cons
     int i, bin, valid;
     long *counts, underflow, overflow;
     double x, width, center, fraction, density;
-    double sample_min, sample_max, sample_sum;
+    double sample_min, sample_max, sample_sum, sample_median;
+    double *finite_values;
     FILE *out;
     
     if(nbins < 1) nbins = 1;
@@ -1094,9 +1410,12 @@ static int write_histogram_file(const char *filename, const char *quantity, cons
     if(!isfinite(xmax) || xmax <= xmin) xmax = xmin + 1.0;
     
     counts = (long *)calloc((size_t)nbins, sizeof(long));
-    if(counts == NULL)
+    finite_values = (double *)malloc(sizeof(double)*(size_t)n);
+    if(counts == NULL || finite_values == NULL)
     {
         fprintf(stderr, "Could not allocate histogram counts for %s\n", filename);
+        free(counts);
+        free(finite_values);
         return 1;
     }
     
@@ -1124,6 +1443,7 @@ static int write_histogram_file(const char *filename, const char *quantity, cons
             if(x > sample_max) sample_max = x;
         }
         sample_sum += x;
+        finite_values[valid] = x;
         valid++;
         
         if(x < xmin)
@@ -1149,14 +1469,19 @@ static int write_histogram_file(const char *filename, const char *quantity, cons
     {
         fprintf(stderr, "No finite values available for histogram %s\n", filename);
         free(counts);
+        free(finite_values);
         return 1;
     }
+    
+    gsl_sort(finite_values, 1, (size_t)valid);
+    sample_median = sorted_quantile(finite_values, valid, 0.5);
     
     out = fopen(filename, "w");
     if(out == NULL)
     {
         fprintf(stderr, "Could not open %s for writing\n", filename);
         free(counts);
+        free(finite_values);
         return 1;
     }
     
@@ -1166,6 +1491,7 @@ static int write_histogram_file(const char *filename, const char *quantity, cons
     fprintf(out, "# bins %d\n", nbins);
     fprintf(out, "# histogram_range %.16e %.16e\n", xmin, xmax);
     fprintf(out, "# sample_min_max_mean %.16e %.16e %.16e\n", sample_min, sample_max, sample_sum/(double)valid);
+    fprintf(out, "# sample_median %.16e\n", sample_median);
     fprintf(out, "# underflow_overflow %ld %ld\n", underflow, overflow);
     fprintf(out, "# columns bin_low bin_high bin_center count fraction density\n");
     
@@ -1181,6 +1507,7 @@ static int write_histogram_file(const char *filename, const char *quantity, cons
     
     fclose(out);
     free(counts);
+    free(finite_values);
     
     return 0;
 }
@@ -1204,6 +1531,23 @@ static double finite_array_max(const double *values, int n)
     }
     
     return found ? xmax : 0.0;
+}
+
+static double sorted_quantile(const double *sorted, long n, double q)
+{
+    long i;
+    double x, frac;
+    
+    if(n <= 0) return 0.0;
+    if(q <= 0.0) return sorted[0];
+    if(q >= 1.0) return sorted[n-1];
+    
+    x = q*(double)(n-1);
+    i = (long)floor(x);
+    frac = x-(double)i;
+    
+    if(i >= n-1) return sorted[n-1];
+    return sorted[i]*(1.0-frac) + sorted[i+1]*frac;
 }
 
 void load_psd(const char *filename, double *Sn, double *freqs, int nfreq, double fmin, double fmax)
@@ -2822,7 +3166,7 @@ static int postprocess_sky_chain(const char *chain_file, long Nside, SkyPostSumm
     long i, k, Npix, Nsample, k90, boundary_count;
     double theta, phi, costh, x, y, level90;
     double logL, DL;
-    double *map, *boundary, *region;
+    double *map, *boundary, *region, *dl_samples;
     char line[4096];
     FILE *in, *out;
     gsl_vector *mv;
@@ -2837,6 +3181,13 @@ static int postprocess_sky_chain(const char *chain_file, long Nside, SkyPostSumm
         summary->boundary_pixels = 0;
         summary->map_theta = 0.0;
         summary->map_phi = 0.0;
+        summary->dl_median = 0.0;
+        summary->dl50_low = 0.0;
+        summary->dl50_high = 0.0;
+        summary->dl50_width = 0.0;
+        summary->dl90_low = 0.0;
+        summary->dl90_high = 0.0;
+        summary->dl90_width = 0.0;
     }
     
     in = fopen(chain_file, "r");
@@ -2872,13 +3223,15 @@ static int postprocess_sky_chain(const char *chain_file, long Nside, SkyPostSumm
     map = skyhist_double_vector(Npix);
     boundary = skyhist_double_vector(Npix);
     region = skyhist_double_vector(Npix);
-    if(map == NULL || boundary == NULL || region == NULL)
+    dl_samples = (double *)malloc(sizeof(double)*(size_t)Nsample);
+    if(map == NULL || boundary == NULL || region == NULL || dl_samples == NULL)
     {
         fprintf(stderr, "Could not allocate sky maps for Nside=%ld\n", Nside);
         fclose(in);
         free(map);
         free(boundary);
         free(region);
+        free(dl_samples);
         return 1;
     }
     
@@ -2897,6 +3250,7 @@ static int postprocess_sky_chain(const char *chain_file, long Nside, SkyPostSumm
         free(map);
         free(boundary);
         free(region);
+        free(dl_samples);
         return 1;
     }
     
@@ -2904,6 +3258,7 @@ static int postprocess_sky_chain(const char *chain_file, long Nside, SkyPostSumm
     while(fgets(line, sizeof(line), in) != NULL && i < Nsample)
     {
         if(sscanf(line, "%ld%lf%lf%lf%lf", &k, &logL, &phi, &costh, &DL) != 5) continue;
+        dl_samples[i] = DL;
         theta = acos(skyhist_clamp_double(costh, -1.0, 1.0));
         if(phi < 0.0) phi += TPI;
         if(phi > TPI) phi -= TPI;
@@ -2914,9 +3269,31 @@ static int postprocess_sky_chain(const char *chain_file, long Nside, SkyPostSumm
     }
     fclose(in);
     fclose(out);
+    Nsample = i;
+    
+    if(Nsample <= 0)
+    {
+        fprintf(stderr, "No usable sky samples found in %s\n", chain_file);
+        free(map);
+        free(boundary);
+        free(region);
+        free(dl_samples);
+        return 1;
+    }
     
     for(i = 0; i < Npix; i++) map[i] /= (double)(Nsample);
     
+    gsl_sort(dl_samples, 1, (size_t)Nsample);
+    if(summary != NULL)
+    {
+        summary->dl_median = sorted_quantile(dl_samples, Nsample, 0.50);
+        summary->dl50_low = sorted_quantile(dl_samples, Nsample, 0.25);
+        summary->dl50_high = sorted_quantile(dl_samples, Nsample, 0.75);
+        summary->dl50_width = summary->dl50_high-summary->dl50_low;
+        summary->dl90_low = sorted_quantile(dl_samples, Nsample, 0.05);
+        summary->dl90_high = sorted_quantile(dl_samples, Nsample, 0.95);
+        summary->dl90_width = summary->dl90_high-summary->dl90_low;
+    }
     mv = gsl_vector_alloc(Npix);
     perm = gsl_permutation_alloc(Npix);
     if(mv == NULL || perm == NULL)
@@ -2927,6 +3304,7 @@ static int postprocess_sky_chain(const char *chain_file, long Nside, SkyPostSumm
         free(map);
         free(boundary);
         free(region);
+        free(dl_samples);
         return 1;
     }
     
@@ -2967,6 +3345,7 @@ static int postprocess_sky_chain(const char *chain_file, long Nside, SkyPostSumm
         free(map);
         free(boundary);
         free(region);
+        free(dl_samples);
         return 1;
     }
     y = (double)(boundary_count)/(double)(Npix)*4.0*pi*(180.0/pi)*(180.0/pi);
@@ -2995,12 +3374,14 @@ static int postprocess_sky_chain(const char *chain_file, long Nside, SkyPostSumm
         free(map);
         free(boundary);
         free(region);
+        free(dl_samples);
         return 1;
     }
     
     free(map);
     free(boundary);
     free(region);
+    free(dl_samples);
     
     return 0;
 }

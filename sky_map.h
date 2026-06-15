@@ -38,6 +38,23 @@
 #ifndef BNS_MAX_DETECTION_TRIES
 #define BNS_MAX_DETECTION_TRIES 1000
 #endif
+// Local BNS merger-rate interval from GWTC-5.0, used to convert the
+// Monte Carlo detection efficiency into detections per year.
+#ifndef BNS_RATE_INTRINSIC_DRAWS
+#define BNS_RATE_INTRINSIC_DRAWS 100
+#endif
+#ifndef BNS_RATE_ORIENTATION_DRAWS
+#define BNS_RATE_ORIENTATION_DRAWS 1000
+#endif
+#ifndef BNS_RATE_DISTANCE_SPLINE_SIZE
+#define BNS_RATE_DISTANCE_SPLINE_SIZE 512
+#endif
+#ifndef BNS_MERGER_RATE_LOW_GPC3_YR
+#define BNS_MERGER_RATE_LOW_GPC3_YR 5.1
+#endif
+#ifndef BNS_MERGER_RATE_HIGH_GPC3_YR
+#define BNS_MERGER_RATE_HIGH_GPC3_YR 154.7
+#endif
 // Settings for the LIGO-style BNS range diagnostic. The range is the
 // volume-equivalent detection distance for a non-spinning 1.4+1.4 Msun binary,
 // averaged over sky position, polarization, and inclination at the SNR threshold.
@@ -61,6 +78,9 @@
 #endif
 #ifndef BNS_MASS_SIGMA_MSUN
 #define BNS_MASS_SIGMA_MSUN 0.2
+#endif
+#ifndef BNS_MASS_MIN_MSUN
+#define BNS_MASS_MIN_MSUN 1.1
 #endif
 #ifndef BNS_MASS_MAX_MSUN
 #define BNS_MASS_MAX_MSUN 2.5
