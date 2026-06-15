@@ -942,15 +942,39 @@ static double estimate_bns_range(struct Net *net, Detector *network, double **SN
  * [0, BNS_SPIN_MAX], extrinsic angles isotropic, and sources uniform in
  * comoving volume out to max_luminosity_distance_mpc.
  *
- * To avoid recomputing the waveform/PSD integral for every distance and sky
- * draw, the MC is nested. We draw a modest number of mass/spin points, compute
- * one detector SNR normalization per intrinsic draw at a reference luminosity
- * distance, then draw many sky/orientation samples. Each angular sample gives
- * a threshold luminosity distance D_thr from rho proportional to 1/D_L. Since
- * the population is uniform in comoving volume, the distance-averaged detection
- * probability for that angular sample is
+ * The brute-force version of this calculation would draw masses, spins, sky
+ * position, orientation, and distance, then call the fast SNR calculator for
+ * every complete source. That is correct, but still expensive because changing
+ * the masses or spins requires a new waveform amplitude and PSD integral. The
+ * sky position, inclination, polarization, and distance only rescale that
+ * detector SNR normalization.
+ *
+ * To keep the diagnostic cheap, the MC is nested:
+ *
+ *   1. Draw BNS intrinsic parameters: m1, m2, chi1, chi2.
+ *   2. Generate the waveform once at BNS_RANGE_REFERENCE_DISTANCE_MPC and
+ *      compute the per-detector SNR^2 normalization using fast_detector_snr2_norms().
+ *   3. Draw many sky/orientation samples for that same intrinsic draw.
+ *   4. For each angular sample, combine the detector normalizations with the
+ *      antenna patterns and inclination factors to get rho_ref at the reference
+ *      distance.
+ *   5. Convert rho_ref into the luminosity distance D_thr at which the same
+ *      source would cross BNS_SNR_THRESHOLD, using rho proportional to 1/D_L.
+ *
+ * We do not Monte Carlo sample the source distance in this routine. Since the
+ * population is uniform in comoving volume, the distance-averaged detection
+ * probability for one angular sample is just the enclosed comoving-volume
+ * fraction out to D_thr,
  *
  *     p_dist = min[(D_c(D_thr) / D_c,max)^3, 1].
+ *
+ * The D_L -> p_dist conversion is tabulated once with a GSL spline. This avoids
+ * calling the cosmology redshift solver inside the sky/orientation loop.
+ *
+ * The returned detection efficiency is the average of p_dist over all nested
+ * mass/spin and sky/orientation samples. The quoted uncertainty is estimated
+ * from the scatter of the per-intrinsic-draw means; it is meant as a useful MC
+ * diagnostic, not as part of the astrophysical rate credible interval.
  *
  * The expected number of detections per year is then
  *
